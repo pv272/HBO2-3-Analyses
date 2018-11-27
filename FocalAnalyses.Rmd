@@ -1,0 +1,224 @@
+---
+title: "HBO2"
+author: "Philippe"
+date: "26 November 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+The aim is to analyse the effect of group composition and breeding status of the colony on the behavioural response of resident to male immigration.
+
+```{r setup, include=FALSE}
+rm(list=ls())#clean environment
+
+library(RMySQL)
+library(getPass)
+library(EloRating)
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(hms)
+```
+
+We start by establishing a connection with the database
+```{r Database connection}
+con <- dbConnect(MySQL(), user = 'philippev',password = getPass(),  
+                 dbname = 'Moleratdatabase', host = 'Kalahariresearch.org')
+
+#dbDisconnect(con)
+
+#set seed to get always the same randomization
+set.seed(123)
+```
+
+The first thing that one has to do is to extract the information on Colony composition on the day of observation 
+
+```{r extract group composition info}
+
+Membership <- con %>%
+  dbGetQuery ("SELECT 
+    AnimalRef,
+    AnimalID,
+    DATE(MemberFrom) AS MemberFrom,
+    DATE(MemberTo) AS MemberTo,
+    MemberShipBetween.ColonyRef,
+    MemberDays,
+     MemberShipBetween.Colony AS QueriedColony,
+    tblColonyCodes.ColonyOrigin
+FROM
+    MoleratViews_Pending.MemberShipBetween
+LEFT JOIN
+    Moleratdatabase.tblColonyCodes ON MoleratViews_Pending.MemberShipBetween.ColonyRef = tblColonyCodes.ColonyRef
+WHERE MemberShipBetween.ColonyRef <> 120 
+AND MemberShipBetween.Colony <> 'Exported_Nigel'") %>% 
+  mutate(MemberFrom=ymd(MemberFrom),MemberTo=ymd(MemberTo)) %>% 
+  select(AnimalRef,AnimalID,MemberFrom,MemberTo,QueriedColony,ColonyOrigin)
+
+#get sex from the database
+Sex<-con %>% 
+  dbGetQuery("SELECT *
+FROM Moleratdatabase.tblSex
+") %>% 
+  select(AnimalID,Sex)
+
+#get the weight from the database
+WeightList<-con %>% 
+  dbGetQuery("SELECT * FROM user_philippev.Weight_AnimalID") %>% 
+  mutate(WeightDate=ymd(WeightDate)) %>% 
+  select(AnimalID,WeightDate,Weight,WeightType) %>% 
+  filter(!(is.na(Weight)))
+
+#get the id characteristic from the database 
+ID_Characteristic <-
+  con %>% 
+  dbGetQuery("SELECT * FROM user_philippev.ID_Characteristic") %>% 
+  mutate(BirthDate=ymd(BirthDate),DeathDate=ymd(DeathDate),Mother_FirstLitter=ymd(Mother_FirstLitter),Father_FirstLitter=ymd(Father_FirstLitter)) %>% 
+  select(AnimalID,Sex,Wildcaught,WildcaughtQueen,BirthDate,LitterRef,Mother_FirstLitter,Father_FirstLitter,DeathDate)
+
+```
+
+The first step is to get the focal Session 
+```{r focal data}
+
+#get the focal sessions from the database 
+Focal<-con %>% 
+  dbGetQuery("SELECT * FROM user_philippev.HBO2_FocalSession") %>% 
+  rename(Date=ObsDate,Colony=ResidentColony) %>% 
+  mutate(Treatment=as.factor(Treatment),Date=ymd(Date))
+
+```
+
+The second step is to get the group composition data
+```{r}
+source("Group_functions.R")
+
+#the colony has already been extracted so we can go straight to the group comp 
+List<-Focal %>% 
+  select(Colony,Date)
+names(List)
+
+#get GroupComp
+GroupComp<-get_GroupComp(List,Membership)
+names(GroupComp)
+nrow(GroupComp)
+
+
+#add the closest Weight to all animals within the group
+#we lose 3 lines, because 3 animals have no weigth thus no date of weight and thus no timediff can be computed 
+Weight<-get_Weight(GroupComp %>% select(AnimalID,Date),WeightList)
+names(Weight)
+nrow(Weight)
+
+#get individual information 
+ID_Info<-get_IDinfo(GroupComp %>% select(AnimalID,Date),ID_Characteristic)
+View(ID_Info)
+nrow(ID_Info)#all matches all good 
+names(ID_Info)
+
+names(ID_Characteristic)
+
+#Bring all info together before calculating the characteristic of the group 
+#On the database, I would need to add the paternity of originally wildcaught colony and make sure the paternity of lab formed colony is exact
+#what to do with age rank and individual of unknown age? They are older but they cannot be distinguished with one another. 
+Group_ID_Info <-
+  left_join(GroupComp,Weight) %>% 
+  left_join(.,ID_Info)
+
+View(Group_ID_Info)
+
+
+#get the additional information of the group at every day of observation
+#in case one may need to add rank after removing the breeders: 
+Group_AllInfo<-get_GroupID_Info(Group_ID_Info) %>% 
+  group_by(Colony,Date) %>% 
+  mutate(Male09=sum(Sex=="M" & (Age >9|is.na(Age))),Male12=sum(Sex=="M" & (Age >12|is.na(Age))),Male15=sum(Sex=="M" & (Age >15|is.na(Age))),Male18=sum(Sex=="M" & (Age >18|is.na(Age)))) %>% 
+    mutate(Female09=sum(Sex=="F" & (Age >9|is.na(Age))),Female12=sum(Sex=="F" & (Age >12|is.na(Age))),Female15=sum(Sex=="F" & (Age >15|is.na(Age))),Female18=sum(Sex=="F" & (Age >18|is.na(Age)))) %>% 
+  mutate(MaleNB=sum(Sex=="M"), FemaleNB=sum(Sex=="F")) %>% 
+  ungroup()
+
+names(Group_AllInfo)
+
+```
+
+## Data Exploration 
+Before we carry out any analyses we shall have a look at what our sample size 
+
+the first analysis is to see how the duration of the observation varies as a function of treatment and group characteristic 
+
+```{r}
+names(Colony)
+
+Colony<-inner_join(Focal,Group_AllInfo %>% select(Colony,Date,PupPresence,GroupSize,Male09:FemaleNB) %>% 
+    distinct()) %>% 
+  mutate(Treatment = factor(Treatment, levels = c( "Breeding", "Queenless","Kingless","Breederless"))) %>% 
+  gather(.,Subset,Count,Male09:FemaleNB)
+View(Colony)
+str(Colony)
+
+# distribution of the group size
+ggplot(Colony,aes(Treatment,GroupSize))+
+  geom_boxplot(outlier.shape=NA)+
+  geom_jitter(width=0.1,height=0.2,size=2,col=1,alpha=0.2)+
+  theme_classic()
+
+#distribution of male number and female number 
+ggplot(Colony,aes(Treatment,Count))+
+  geom_boxplot(outlier.shape=NA)+
+  geom_jitter(width=0.1,height=0.2,size=2,col=1,alpha=0.2)+
+  facet_wrap(.~Subset, ncol = 5)+
+  theme(axis.text.x= element_text(size=4))
+
+
+```
+
+
+
+```{r duration data}
+#get all the duration data together. 
+Duration<-inner_join(Focal,Group_AllInfo %>% select(Colony,Date,PupPresence,GroupSize,Male9:FemaleNB) %>% 
+    distinct()) %>% 
+mutate(Treatment = factor(Treatment, levels = c( "Breeding", "Queenless","Kingless","Breederless")))
+nrow(Duration)
+
+
+
+#first visualise the data
+ggplot(Duration,aes(Treatment,Duration))+
+  geom_boxplot(outlier.shape=NA)+
+  geom_jitter(width=0.1,height=0.2,size=2,col=1,alpha=0.2)+
+  theme_classic()
+
+#it looks like there is a bimodal distribution . Either the colony defend or they don't. It would be nice to see what makes the difference 
+ggplot(Duration,aes(Treatment,Duration))+
+  geom_violin()
+
+names(Duration)
+
+ggplot(Duration,aes(MaleNB,Duration,col=Treatment))+
+  geom_point()+
+  geom_smooth(method = "lm",se=FALSE)+
+  theme_classic()
+ 
+
+
+
+
+
+```
+
+
+
+
+
+
+#effect on mating from resident (reflects how many times the intruder could mate)
+total number of mating within a colony
+percentage of the female present in the group that could mate
+
+##Effect on aggressive behaviours 
+
